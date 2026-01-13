@@ -1,4 +1,3 @@
-
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
@@ -7,302 +6,328 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-// For health checks (Render requires this)
+// Green API Credentials
+const ID_INSTANCE = process.env.ID_INSTANCE || "7105466322";
+const API_TOKEN_INSTANCE = process.env.API_TOKEN_INSTANCE;
+const GREEN_API_URL = "https://7105.api.green-api.com";
+
+// Store last processed messages (to avoid duplicates)
+const processedMessages = new Set();
+
+// ====================
+// HEALTH CHECK
+// ====================
 app.get("/", (req, res) => {
-  res.json({ 
-    status: "active", 
-    service: "WhatsApp GST Bot",
-    message: "Webhook is running successfully"
+  res.json({
+    status: "active",
+    service: "WhatsApp GST Bot (Green API Polling)",
+    idInstance: ID_INSTANCE,
+    polling: "Every 5 seconds"
   });
 });
 
-/* 🔹 Webhook Verification */
-app.get("/webhook", (req, res) => {
-  console.log("Webhook verification attempt:", req.query);
-  
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
-    console.log("Webhook verified successfully!");
-    return res.status(200).send(challenge);
-  }
-  
-  console.log("Webhook verification failed. Check VERIFY_TOKEN.");
-  return res.sendStatus(403);
-});
-
-/* 🔹 Receive Messages */
-app.post("/webhook", async (req, res) => {
-  console.log("Received webhook:", JSON.stringify(req.body, null, 2));
-  
-  // Always respond immediately (Meta requirement)
-  res.sendStatus(200);
-  
+// ====================
+// POLL FOR NEW MESSAGES
+// ====================
+async function pollMessages() {
   try {
-    const entry = req.body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const message = changes?.value?.messages?.[0];
-
-    if (!message) {
-      console.log("No message found in webhook payload");
+    console.log("🔍 Checking for new WhatsApp messages...");
+    
+    // 1. RECEIVE NOTIFICATION
+    const receiveUrl = `${GREEN_API_URL}/waInstance${ID_INSTANCE}/receiveNotification/${API_TOKEN_INSTANCE}`;
+    const notificationResponse = await axios.get(receiveUrl, {
+      timeout: 10000
+    });
+    
+    const notification = notificationResponse.data;
+    
+    if (!notification || !notification.body) {
+      console.log("⏳ No new messages");
       return;
     }
-
-    const from = message.from;
-    const text = message.text?.body?.trim();
-
-    if (!text) {
-      console.log("No text in message");
-      return;
+    
+    console.log("📩 New notification received:", JSON.stringify(notification, null, 2));
+    
+    const receiptId = notification.receiptId;
+    const messageData = notification.body;
+    
+    // 2. PROCESS THE MESSAGE
+    if (messageData.typeWebhook === "incomingMessageReceived") {
+      const messageType = messageData.messageData.typeMessage;
+      
+      if (messageType === "textMessage") {
+        const userPhone = messageData.senderData.senderId.replace("@c.us", "");
+        const userMessage = messageData.messageData.textMessageData.textMessage;
+        const messageId = messageData.idMessage;
+        
+        // Check if already processed
+        if (!processedMessages.has(messageId)) {
+          console.log(`💬 New message from ${userPhone}: "${userMessage}"`);
+          processedMessages.add(messageId);
+          
+          // Process in background
+          processMessage(userPhone, userMessage);
+        }
+      }
     }
+    
+    // 3. DELETE NOTIFICATION (IMPORTANT!)
+    if (receiptId) {
+      await deleteNotification(receiptId);
+      console.log(`✅ Deleted notification: ${receiptId}`);
+    }
+    
+  } catch (error) {
+    console.error("❌ Polling error:", error.message);
+  }
+}
 
-    console.log(`Message from ${from}: ${text}`);
+// ====================
+// DELETE NOTIFICATION
+// ====================
+async function deleteNotification(receiptId) {
+  try {
+    const deleteUrl = `${GREEN_API_URL}/waInstance${ID_INSTANCE}/deleteNotification/${API_TOKEN_INSTANCE}/${receiptId}`;
+    await axios.delete(deleteUrl);
+  } catch (error) {
+    console.error("❌ Delete notification error:", error.message);
+  }
+}
+
+// ====================
+// PROCESS MESSAGE
+// ====================
+async function processMessage(userPhone, message) {
+  try {
+    const cleanMessage = message.trim();
     
-    // Check if message is a GST number
-    const gstNumber = extractGSTNumber(text);
-    
-    if (gstNumber) {
-      console.log(`Processing GST number: ${gstNumber}`);
-      await handleGSTRequest(from, gstNumber);
+    // Check if it's a GST number
+    if (isGSTNumber(cleanMessage)) {
+      console.log(`🔍 Processing GST: ${cleanMessage}`);
+      await handleGSTRequest(userPhone, cleanMessage);
     } else {
       // Send help message
-      await sendMessage(from, 
-        `📋 *Welcome to GST Verification Bot*\n\n` +
-        `Please send a valid GST number (15 characters).\n` +
-        `Example: *29AADCB2230M1Z2*\n\n` +
-        `I will check the filing status and provide details.`
+      await sendWhatsAppMessage(userPhone,
+        `📋 *GST Verification Bot*\n\n` +
+        `Send a 15-digit GST number to check:\n` +
+        `• Filing Status\n` +
+        `• Business Details\n` +
+        `• Alert if not filed\n\n` +
+        `Example: *29AADCB2230M1Z2*`
       );
     }
     
   } catch (error) {
-    console.error("Error processing webhook:", error);
+    console.error("Process message error:", error);
   }
-});
+}
 
-/* 🔹 Handle GST Number Request */
+// ====================
+// HANDLE GST REQUEST
+// ====================
 async function handleGSTRequest(userPhone, gstNumber) {
   try {
     // Send "processing" message
-    await sendMessage(userPhone, `🔍 Checking GST: ${gstNumber}\nPlease wait...`);
-
-    // 1. Validate GST format
+    await sendWhatsAppMessage(userPhone, `🔍 Checking GST: ${gstNumber}\nPlease wait...`);
+    
+    // Validate GST format
     if (!isValidGSTFormat(gstNumber)) {
-      await sendMessage(userPhone, 
+      await sendWhatsAppMessage(userPhone,
         `❌ *Invalid GST Format*\n\n` +
-        `GST Number: ${gstNumber}\n` +
-        `Please send a valid 15-character GST number.\n` +
-        `Format: 2 digits + 10 chars + 3 digits\n` +
-        `Example: 29AADCB2230M1Z2`
+        `Please send a valid 15-digit GST number.\n` +
+        `Format: 29AADCB2230M1Z2`
       );
       return;
     }
-
-    // 2. Call GST API or Database (Replace with your actual API)
+    
+    // Call GST API (Replace with your teammate's API)
     const gstDetails = await fetchGSTDetails(gstNumber);
     
     if (!gstDetails || gstDetails.error) {
-      await sendMessage(userPhone, 
+      await sendWhatsAppMessage(userPhone,
         `❌ *GST Not Found*\n\n` +
-        `GST Number: *${gstNumber}*\n` +
-        `This GST number is not registered or not found in our database.\n\n` +
-        `Please verify the number and try again.`
+        `GST: ${gstNumber}\n` +
+        `Not found in database.\n` +
+        `Please verify and try again.`
       );
       return;
     }
-
-    // 3. Format and send response based on filing status
-    const responseMessage = formatGSTResponse(gstNumber, gstDetails);
-    await sendMessage(userPhone, responseMessage);
-
-    // 4. Send alert if not filed
-    if (!gstDetails.isFiled && gstDetails.dueDate) {
-      const today = new Date();
-      const dueDate = new Date(gstDetails.dueDate);
-      const daysRemaining = Math.ceil((dueDate - today) / (1000 * 60 * 60 * 24));
-      
-      if (daysRemaining <= 7) {
-        await sendMessage(userPhone,
-          `🚨 *URGENT ALERT*\n\n` +
-          `GST: *${gstNumber}*\n` +
-          `Status: *NOT FILED*\n` +
-          `Due Date: *${gstDetails.dueDate}*\n` +
-          `Days Remaining: *${daysRemaining}*\n\n` +
-          `Please file immediately to avoid penalties!`
-        );
-      }
+    
+    // Send GST details
+    const response = formatGSTResponse(gstNumber, gstDetails);
+    await sendWhatsAppMessage(userPhone, response);
+    
+    // Send alert if not filed
+    if (!gstDetails.isFiled) {
+      await sendAlert(userPhone, gstNumber, gstDetails);
     }
-
+    
   } catch (error) {
-    console.error("Error in handleGSTRequest:", error);
-    await sendMessage(userPhone,
-      `⚠️ *Service Temporarily Unavailable*\n\n` +
-      `We encountered an error while processing GST: ${gstNumber}\n` +
-      `Please try again in a few minutes.`
+    console.error("GST request error:", error);
+    await sendWhatsAppMessage(userPhone,
+      `⚠️ Service temporarily unavailable.\nPlease try again later.`
     );
   }
 }
 
-/* 🔹 Helper Functions */
+// ====================
+// HELPER FUNCTIONS
+// ====================
 
-// Extract GST number from text (could be in a sentence)
-function extractGSTNumber(text) {
-  // Remove all spaces and special characters
-  const cleaned = text.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-  
-  // Check if it looks like a GST number (15 characters, starts with 2 digits)
-  if (cleaned.length === 15 && /^\d{2}/.test(cleaned)) {
-    return cleaned;
-  }
-  
-  // Try to find GST pattern in longer text
-  const gstPattern = /(\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1})/i;
-  const match = text.match(gstPattern);
-  return match ? match[1].toUpperCase() : null;
+// Check if text is GST number
+function isGSTNumber(text) {
+  const clean = text.replace(/[^a-zA-Z0-9]/g, '');
+  return clean.length === 15 && /^\d{2}/.test(clean);
 }
 
-// Validate GST number format
+// Validate GST format
 function isValidGSTFormat(gst) {
-  // GST format: 29AADCB2230M1Z2 (2 digits + 10 chars + 3 digits)
   const gstRegex = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}[Z]{1}[0-9A-Z]{1}$/;
   return gstRegex.test(gst.toUpperCase());
 }
 
-// Fetch GST details from API (REPLACE THIS WITH YOUR ACTUAL API)
+// Fetch GST details (REPLACE WITH TEAMMATE'S API)
 async function fetchGSTDetails(gstNumber) {
   try {
-    console.log(`Fetching GST details for: ${gstNumber}`);
+    console.log(`🌐 Fetching GST: ${gstNumber}`);
     
-    // 🔹 REPLACE THIS WITH YOUR TEAMMATE'S ACTUAL API ENDPOINT 🔹
-    // Example API call:
-    // const response = await axios.get(`https://your-gst-api.com/v1/gst/${gstNumber}`, {
-    //   headers: { 'Authorization': `Bearer ${process.env.GST_API_KEY}` }
-    // });
+    // ⚠️ REPLACE THIS WITH YOUR TEAMMATE'S API ⚠️
+    // Example:
+    // const response = await axios.get(`https://teammate-api.com/gst/${gstNumber}`);
     // return response.data;
     
-    // 🔹 TEMPORARY MOCK DATA - REMOVE THIS IN PRODUCTION 🔹
-    // Simulate API delay
+    // Mock data for testing
     await new Promise(resolve => setTimeout(resolve, 1000));
     
-    // Mock response - Replace with actual API response
-    const mockData = {
+    return {
       gstNumber: gstNumber,
-      businessName: "SAMPLE BUSINESS PRIVATE LIMITED",
-      legalName: "Sample Business Pvt Ltd",
-      stateCode: gstNumber.substring(0, 2),
-      registrationDate: "2022-05-15",
-      businessType: "Regular",
+      businessName: "SAMPLE BUSINESS PVT LTD",
       status: "Active",
-      isFiled: Math.random() > 0.3, // 70% chance of filed
-      lastFiled: "2024-01-25",
-      dueDate: "2024-02-20",
-      address: "123 Business Street, Mumbai, Maharashtra 400001",
-      contact: "9876543210",
-      turnover: "₹5.2 Cr (2023-24)",
-      complianceScore: Math.floor(Math.random() * 30) + 70 // 70-100
+      isFiled: Math.random() > 0.4,
+      lastFiled: "2024-01-20",
+      dueDate: "2024-02-25",
+      address: "Mumbai, Maharashtra",
+      turnover: "₹5.2 Cr"
     };
     
-    return mockData;
-    
   } catch (error) {
-    console.error("GST API Error:", error.message);
-    return { error: "API not available", message: error.message };
+    console.error("GST API error:", error);
+    return null;
   }
 }
 
-// Format GST response message
+// Format GST response
 function formatGSTResponse(gstNumber, details) {
-  const statusEmoji = details.isFiled ? "✅" : "❌";
-  const statusText = details.isFiled ? "FILED" : "NOT FILED";
+  const status = details.isFiled ? "✅ FILED" : "❌ NOT FILED";
   
-  return `
-📄 *GST Verification Results*
-
-*GST Number:* ${gstNumber}
-*Business Name:* ${details.businessName}
-*Legal Name:* ${details.legalName}
-*State Code:* ${details.stateCode}
-*Status:* ${statusEmoji} ${statusText}
-
-📅 *Filing Details:*
-• Registration Date: ${details.registrationDate}
-• Last Filed: ${details.lastFiled || 'N/A'}
-• Due Date: ${details.dueDate || 'N/A'}
-• Business Type: ${details.businessType}
-• Compliance Score: ${details.complianceScore || 'N/A'}%
-
-🏢 *Business Info:*
-• Address: ${details.address}
-• Contact: ${details.contact || 'N/A'}
-• Turnover: ${details.turnover || 'N/A'}
-
-${details.isFiled ? 
-  '✅ *All GST returns are filed up to date.*' : 
-  '⚠️ *GST returns are pending. Please file immediately.*'}
-  `.trim();
+  return `📄 *GST VERIFICATION*\n\n` +
+         `*GST:* ${gstNumber}\n` +
+         `*Business:* ${details.businessName}\n` +
+         `*Status:* ${status}\n\n` +
+         `*Last Filed:* ${details.lastFiled || 'N/A'}\n` +
+         `*Due Date:* ${details.dueDate || 'N/A'}\n` +
+         `*Turnover:* ${details.turnover || 'N/A'}\n\n` +
+         `${details.isFiled ? '✅ All returns filed' : '⚠️ Returns pending'}`;
 }
 
-/* 🔹 Send Message Function */
-async function sendMessage(to, text) {
+// Send alert for unfiled GST
+async function sendAlert(userPhone, gstNumber, details) {
+  if (details.dueDate) {
+    const today = new Date();
+    const dueDate = new Date(details.dueDate);
+    const daysLeft = Math.ceil((dueDate - today) / (1000 * 60 * 60 * 24));
+    
+    if (daysLeft <= 7) {
+      await sendWhatsAppMessage(userPhone,
+        `🚨 *ALERT: GST NOT FILED*\n\n` +
+        `GST: ${gstNumber}\n` +
+        `Due: ${details.dueDate}\n` +
+        `Days left: ${daysLeft}\n\n` +
+        `File immediately to avoid penalty!`
+      );
+    }
+  }
+}
+
+// ====================
+// SEND WHATSAPP MESSAGE
+// ====================
+async function sendWhatsAppMessage(phoneNumber, message) {
   try {
-    console.log(`Sending message to ${to}: ${text.substring(0, 50)}...`);
+    const chatId = `${phoneNumber}@c.us`;
+    
+    console.log(`📤 Sending to ${chatId}: ${message.substring(0, 30)}...`);
     
     const response = await axios.post(
-      `https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`,
+      `${GREEN_API_URL}/waInstance${ID_INSTANCE}/sendMessage/${API_TOKEN_INSTANCE}`,
       {
-        messaging_product: "whatsapp",
-        recipient_type: "individual",
-        to: to,
-        type: "text",
-        text: { 
-          body: text,
-          preview_url: false
-        }
+        chatId: chatId,
+        message: message
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
           "Content-Type": "application/json"
-        },
-        timeout: 10000 // 10 second timeout
+        }
       }
     );
     
-    console.log("Message sent successfully:", response.data);
+    console.log("✅ Message sent, ID:", response.data?.idMessage);
     return response.data;
     
   } catch (error) {
-    console.error("Error sending message:", error.response?.data || error.message);
+    console.error("❌ Send error:", error.response?.data || error.message);
     throw error;
   }
 }
 
-/* 🔹 Error Handling Middleware */
-app.use((err, req, res, next) => {
-  console.error("Server error:", err);
-  res.status(500).json({ error: "Internal server error" });
+// ====================
+// CHECK GREEN API STATUS
+// ====================
+app.get("/check-status", async (req, res) => {
+  try {
+    // Check account state
+    const stateUrl = `${GREEN_API_URL}/waInstance${ID_INSTANCE}/getStateInstance/${API_TOKEN_INSTANCE}`;
+    const stateResponse = await axios.get(stateUrl);
+    
+    // Check settings (webhook)
+    const settingsUrl = `${GREEN_API_URL}/waInstance${ID_INSTANCE}/getSettings/${API_TOKEN_INSTANCE}`;
+    const settingsResponse = await axios.get(settingsUrl);
+    
+    res.json({
+      state: stateResponse.data,
+      settings: settingsResponse.data,
+      instanceId: ID_INSTANCE,
+      pollingActive: true
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      error: "Green API check failed",
+      details: error.message
+    });
+  }
 });
 
-// Handle 404
-app.use((req, res) => {
-  res.status(404).json({ error: "Route not found" });
-});
-
-/* 🔹 Start Server */
+// ====================
+// START POLLING & SERVER
+// ====================
 const PORT = process.env.PORT || 10000;
+
+// Start polling every 5 seconds
+setInterval(pollMessages, 5000);
+
 app.listen(PORT, () => {
   console.log(`
-  🚀 WhatsApp GST Bot Started!
+  🟢 GREEN API WHATSAPP BOT (POLLING)
+  ═══════════════════════════════════
   ✅ Port: ${PORT}
-  ✅ Webhook: http://localhost:${PORT}/webhook
+  ✅ ID Instance: ${ID_INSTANCE}
+  ✅ Polling: Every 5 seconds
   ✅ Health: http://localhost:${PORT}/
-  ✅ Environment: ${process.env.NODE_ENV || 'development'}
+  ✅ Status: http://localhost:${PORT}/check-status
+  ═══════════════════════════════════
   `);
-});
-
-// Handle graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
-  process.exit(0);
+  
+  // Initial poll
+  setTimeout(pollMessages, 1000);
 });
